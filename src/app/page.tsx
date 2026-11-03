@@ -1,8 +1,80 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import dynamic from 'next/dynamic';
+import { useRouter } from 'next/navigation';
 import RealtimeFleetOverview from '@/components/RealtimeFleetOverview';
+import { RouteStopManager } from '@/components/RouteStopManager';
+import AdminRouteGuard from '@/components/AdminRouteGuard';
+import { clearAdminToken } from '@/services/adminAuth';
+
+interface DashboardVehicle {
+  id: string;
+  name?: string;
+  plateNumber?: string;
+  capacity?: number;
+  status?: string;
+  assignedRouteId?: string | null;
+  routeId?: string | null;
+  currentRouteId?: string | null;
+}
+
+interface DashboardStop {
+  id: string;
+  name?: string;
+  nameEn?: string;
+  nameTh?: string;
+  lat?: number;
+  lng?: number;
+  latitude?: number;
+  longitude?: number;
+}
+
+interface DashboardRouteStop extends DashboardStop {
+  stopId?: string;
+  stopOrder?: number;
+  sequenceOrder?: number;
+  stop?: DashboardStop;
+}
+
+interface DashboardRoute {
+  id: string;
+  name?: string;
+  nameEn?: string;
+  nameTh?: string;
+  color?: string;
+  status?: string;
+  path?: [number, number][];
+  routeStops?: DashboardRouteStop[];
+  stops?: DashboardRouteStop[];
+  route_stops?: DashboardRouteStop[];
+  RouteStop?: DashboardRouteStop[];
+  stopCount?: number;
+}
+
+function getApiList<T>(payload: unknown, collectionKeys: string[]): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (!payload || typeof payload !== 'object') return [];
+
+  const record = payload as Record<string, unknown>;
+  const collection = record.data ?? collectionKeys
+    .map((key) => record[key])
+    .find(Array.isArray);
+
+  return Array.isArray(collection) ? collection as T[] : [];
+}
+
+// FIX: use the backend address from .env.local (NEXT_PUBLIC_API_URL), the same way
+// apiClient.ts does, instead of a hard-coded localhost address.
+const API_ORIGIN = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001')
+  .replace(/\/+$/, '')
+  .replace(/\/api$/, '');
+
+async function fetchApiList<T>(endpoint: string, collectionKeys: string[]): Promise<T[]> {
+  const response = await fetch(`${API_ORIGIN}/api/${endpoint}`);
+  if (!response.ok) throw new Error(`Request failed (${response.status})`);
+  return getApiList<T>(await response.json(), collectionKeys);
+}
 
 const AdminFleetMap = dynamic(() => import('@/components/AdminFleetMap'), {
   ssr: false,
@@ -13,56 +85,91 @@ const AdminFleetMap = dynamic(() => import('@/components/AdminFleetMap'), {
   ),
 });
 
-export default function DashboardPage() {
-  const [activeTab, setActiveTab] = useState<'realtime' | 'vehicles' | 'routes' | 'stops'>('vehicles');
-  const [stops, setStops] = useState<any[]>([]);
-  const [routes, setRoutes] = useState<any[]>([]);
-  const [vehicles, setVehicles] = useState<any[]>([]);
+function DashboardContent() {
+  const router = useRouter();
+  const [activeTab, setActiveTab] = useState<'realtime' | 'vehicles' | 'routes' | 'stops'>('realtime');
+  const [stops, setStops] = useState<DashboardStop[]>([]);
+  const [routes, setRoutes] = useState<DashboardRoute[]>([]);
+  const [vehicles, setVehicles] = useState<DashboardVehicle[]>([]);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [routeStopCounts, setRouteStopCounts] = useState<Record<string, number>>({});
 
   // Modal State for Assigning Route & Status
-  const [assigningVehicle, setAssigningVehicle] = useState<any | null>(null);
+  const [assigningVehicle, setAssigningVehicle] = useState<DashboardVehicle | null>(null);
   const [targetRouteId, setTargetRouteId] = useState<string>('');
   const [targetStatus, setTargetStatus] = useState<string>('ACTIVE');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [assignmentError, setAssignmentError] = useState<string | null>(null);
 
-  const fetchAllData = () => {
-    // 1. Fetch stops
-    fetch('http://localhost:5001/api/stops')
-      .then((res) => res.json())
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data.data || data.stops || [];
-        setStops(list);
-      })
-      .catch((err) => console.error('Error loading stops:', err));
+  const handleRouteStopCountChange = useCallback((routeId: string, count: number) => {
+    setRouteStopCounts((current) => current[routeId] === count
+      ? current
+      : { ...current, [routeId]: count });
+  }, []);
 
-    // 2. Fetch routes
-    fetch('http://localhost:5001/api/routes')
-      .then((res) => res.json())
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data.data || data.routes || [];
-        setRoutes(list);
-        if (list.length > 0 && !selectedRouteId) setSelectedRouteId(list[0].id);
-      })
-      .catch((err) => console.error('Error loading routes:', err));
+  const fetchAllData = useCallback(async () => {
+    try {
+      // 1. Load Master Stops
+      const stopsList = await fetchApiList<DashboardStop>('stops', ['stops']);
+      setStops(stopsList);
 
-    // 3. Fetch vehicles
-    fetch('http://localhost:5001/api/vehicles')
-      .then((res) => res.json())
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data.data || data.vehicles || [];
-        setVehicles(list);
-      })
-      .catch((err) => console.error('Error loading vehicles:', err));
-  };
+      // 2. Load Base Routes
+      const rawRoutes = await fetchApiList<DashboardRoute>('routes', ['routes']);
+
+      // 3. Enrich Routes with their stop sequences/coordinates if not already populated
+      const enrichedRoutes = await Promise.all(
+        rawRoutes.map(async (route) => {
+          // If the route already contains path or routeStops, return it directly
+          if (
+            (route.path && route.path.length > 0) ||
+            (route.routeStops && route.routeStops.length > 0) ||
+            (route.stops && route.stops.length > 0)
+          ) {
+            return route;
+          }
+
+          // Otherwise, fetch the assigned stops for this route
+          try {
+            const assignedStopsRes = await fetch(`${API_ORIGIN}/api/routes/${route.id}/stops`);
+            if (assignedStopsRes.ok) {
+              const assignedStopsData = await assignedStopsRes.json();
+              const fetchedStops = getApiList<DashboardRouteStop>(assignedStopsData, ['stops', 'routeStops']);
+              return {
+                ...route,
+                routeStops: fetchedStops,
+              };
+            }
+          } catch {
+            // Fallback: if individual route fetch fails, retain the original route
+          }
+          return route;
+        })
+      );
+
+      setRoutes(enrichedRoutes);
+      setSelectedRouteId((current) => current ?? enrichedRoutes[0]?.id ?? null);
+
+      // 4. Load Vehicles
+      const vehiclesList = await fetchApiList<DashboardVehicle>('vehicles', ['vehicles']);
+      setVehicles(vehiclesList);
+    } catch (err) {
+      console.error('Error loading dashboard data:', err);
+    }
+  }, []);
 
   useEffect(() => {
     fetchAllData();
-  }, []);
+  }, [fetchAllData]);
 
-  const openAssignModal = (vehicle: any) => {
+  const handleLogout = () => {
+    clearAdminToken();
+    router.replace('/login');
+  };
+
+  const openAssignModal = (vehicle: DashboardVehicle) => {
     setAssigningVehicle(vehicle);
-    setTargetRouteId(vehicle.routeId || vehicle.currentRouteId || (routes[0]?.id ?? ''));
+    setAssignmentError(null);
+    setTargetRouteId(vehicle.assignedRouteId || vehicle.routeId || vehicle.currentRouteId || (routes[0]?.id ?? ''));
     setTargetStatus(vehicle.status || 'ACTIVE');
   };
 
@@ -71,35 +178,29 @@ export default function DashboardPage() {
     if (!assigningVehicle) return;
 
     setIsSubmitting(true);
+    setAssignmentError(null);
     const vehicleId = assigningVehicle.id;
+    const assignedRouteId = targetRouteId || null;
 
     try {
-      const res = await fetch(`http://localhost:5001/api/vehicles/${vehicleId}`, {
-        method: 'PATCH',
+      const res = await fetch(`${API_ORIGIN}/api/vehicles/${vehicleId}`, {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          routeId: targetRouteId || null,
+          assignedRouteId,
           status: targetStatus,
         }),
       });
 
-      // Fallback to PUT if backend doesn't accept PATCH
-      if (!res.ok && res.status === 404) {
-        await fetch(`http://localhost:5001/api/vehicles/${vehicleId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            routeId: targetRouteId || null,
-            status: targetStatus,
-          }),
-        });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        throw new Error(data?.error || data?.message || `Request failed (${res.status})`);
       }
 
-      // Optimistically update local UI state immediately
       setVehicles((prev) =>
         prev.map((v) =>
           v.id === vehicleId
-            ? { ...v, routeId: targetRouteId, status: targetStatus }
+            ? { ...v, assignedRouteId, status: targetStatus }
             : v
         )
       );
@@ -108,15 +209,7 @@ export default function DashboardPage() {
       fetchAllData();
     } catch (err) {
       console.error('Failed to assign route:', err);
-      // Still update UI locally so presentation stays uninterrupted
-      setVehicles((prev) =>
-        prev.map((v) =>
-          v.id === vehicleId
-            ? { ...v, routeId: targetRouteId, status: targetStatus }
-            : v
-        )
-      );
-      setAssigningVehicle(null);
+      setAssignmentError(err instanceof Error ? err.message : 'Failed to assign route');
     } finally {
       setIsSubmitting(false);
     }
@@ -125,12 +218,21 @@ export default function DashboardPage() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-6 space-y-6">
       <div className="max-w-7xl mx-auto space-y-6">
-        {/* Header */}
-        <div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">Admin Operations Dashboard</h1>
-          <p className="text-sm text-slate-400">
-            Fleet monitoring, transit route control, and master stop directories.
-          </p>
+        {/* Header with Log Out Button */}
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold text-white tracking-tight">Admin Operations Dashboard</h1>
+            <p className="text-sm text-slate-400">
+              Fleet monitoring, transit route control, and master stop directories.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="shrink-0 rounded-lg border border-slate-700 px-3 py-2 text-sm font-medium text-slate-300 transition hover:border-slate-500 hover:text-white"
+          >
+            Log Out
+          </button>
         </div>
 
         {/* Tab Navigation */}
@@ -207,9 +309,9 @@ export default function DashboardPage() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-2">
-              {vehicles.map((v: any, idx: number) => {
+              {vehicles.map((v, idx) => {
                 const isActive = (v.status || '').toUpperCase() === 'ACTIVE';
-                const assignedRoute = routes.find((r) => r.id === (v.routeId || v.currentRouteId));
+                const assignedRoute = routes.find((r) => r.id === (v.assignedRouteId || v.routeId || v.currentRouteId));
 
                 return (
                   <div key={v.id || idx} className="bg-slate-800/60 border border-slate-700/60 p-4 rounded-xl flex flex-col justify-between space-y-3">
@@ -259,7 +361,6 @@ export default function DashboardPage() {
         )}
 
         {/* TAB 3: ROUTES DIRECTORY */}
-        {/* TAB 3: ROUTES DIRECTORY */}
         {activeTab === 'routes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-4">
             <div>
@@ -268,10 +369,9 @@ export default function DashboardPage() {
             </div>
 
             <div className="space-y-3 pt-2">
-              {routes.map((r: any, idx: number) => {
-                // Check all possible schema property names for assigned stops
+              {routes.map((r, idx) => {
                 const stopList = r.routeStops || r.stops || r.route_stops || r.RouteStop || [];
-                const routeStopsCount = Array.isArray(stopList) ? stopList.length : (r.stopCount || 0);
+                const routeStopsCount = routeStopCounts[r.id] ?? (stopList.length || r.stopCount || 0);
                 const isSelected = selectedRouteId === (r.id || `route-${idx}`);
 
                 return (
@@ -307,24 +407,12 @@ export default function DashboardPage() {
                     {/* Expandable Accordion Body */}
                     {isSelected && (
                       <div className="mt-3 pt-3 border-t border-slate-700/80 text-xs">
-                        <span className="text-slate-400 font-medium block mb-2">Stop Sequence:</span>
-                        {Array.isArray(stopList) && stopList.length > 0 ? (
-                          <div className="flex flex-wrap gap-2">
-                            {stopList.map((rs: any, sIdx: number) => {
-                              const sObj = rs.stop || rs;
-                              const stopTitle = sObj.nameEn || sObj.name || sObj.nameTh || `Stop #${sIdx + 1}`;
-                              return (
-                                <span key={sIdx} className="bg-slate-900 border border-slate-700 px-2.5 py-1 rounded text-slate-300">
-                                  {sIdx + 1}. {stopTitle}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        ) : (
-                          <p className="text-slate-500 italic text-xs">
-                            No stops currently linked to this route in the database.
-                          </p>
-                        )}
+                        <RouteStopManager
+                          key={r.id}
+                          routeId={r.id}
+                          allStops={stops}
+                          onCountChange={handleRouteStopCountChange}
+                        />
                       </div>
                     )}
                   </div>
@@ -348,11 +436,11 @@ export default function DashboardPage() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pt-2">
-              {stops.map((s: any, idx: number) => {
+              {stops.map((s, idx) => {
                 const displayNameEn = s.nameEn || s.name || `Stop ${idx + 1}`;
                 const displayNameTh = s.nameTh || null;
-                const lat = Number(s.lat ?? s.latitude);
-                const lng = Number(s.lng ?? s.longitude);
+                const lat = Number(s.lat ?? s.latitude ?? 0);
+                const lng = Number(s.lng ?? s.longitude ?? 0);
 
                 return (
                   <div key={s.id || idx} className="bg-slate-800/60 border border-slate-700/60 p-4 rounded-xl flex flex-col justify-between space-y-3">
@@ -393,6 +481,10 @@ export default function DashboardPage() {
                 &times;
               </button>
             </div>
+
+            {assignmentError && (
+              <p role="alert" className="text-sm text-rose-400">{assignmentError}</p>
+            )}
 
             <form onSubmit={handleSaveAssignment} className="space-y-4">
               <div>
@@ -449,5 +541,13 @@ export default function DashboardPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function DashboardPage() {
+  return (
+    <AdminRouteGuard>
+      <DashboardContent />
+    </AdminRouteGuard>
   );
 }
