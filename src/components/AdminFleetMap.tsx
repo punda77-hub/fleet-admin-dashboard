@@ -334,6 +334,75 @@ const ROUTE_LINE_OPTIONS = { lineJoin: 'round', lineCap: 'round' } as const;
 // Leaflet's default of 1 drops the small real bends in a road
 const ROUTE_SMOOTH_FACTOR = 0.25;
 
+// FIX: the moving dots are drawn and animated directly with Leaflet, in their own map
+// layer above the route lines. The old version used a CSS animation, which only worked in
+// development mode (npm run dev) and stood still on the Vercel production build.
+// Respects the "Reduce motion" setting.
+const FLOW_DASH = '1 18';
+const FLOW_PERIOD_PX = 19; // length of one dash + gap
+const FLOW_SPEED_PX_PER_S = 27;
+const FLOW_TICK_MS = 40;
+const FLOW_PANE = 'route-flow-pane';
+
+function FlowDots({ routes, weight }: { routes: RenderableRoute[]; weight: number }) {
+  const map = useMap();
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let layers: import('leaflet').Polyline[] = [];
+
+    (async () => {
+      const L = (await import('leaflet')).default;
+      if (cancelled) return;
+
+      // Own pane between the route lines (400) and the markers (600), so the dots are
+      // always on top of the lines and never cover a stop or a bus
+      if (!map.getPane(FLOW_PANE)) {
+        const pane = map.createPane(FLOW_PANE);
+        pane.style.zIndex = '450';
+        pane.style.pointerEvents = 'none';
+      }
+
+      layers = routes
+        .filter((route) => !route.dashArray && route.positions.length > 1)
+        .map((route) =>
+          L.polyline(route.positions, {
+            ...ROUTE_LINE_OPTIONS,
+            pane: FLOW_PANE,
+            color: '#ffffff',
+            weight: Math.max(2, weight - 3),
+            opacity: 0.95,
+            dashArray: FLOW_DASH,
+            interactive: false,
+            smoothFactor: ROUTE_SMOOTH_FACTOR,
+          }).addTo(map)
+        );
+
+      const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      if (reduceMotion) return;
+
+      const start = performance.now();
+      timer = window.setInterval(() => {
+        const travelled = ((performance.now() - start) / 1000) * FLOW_SPEED_PX_PER_S;
+        const offset = `${-(travelled % FLOW_PERIOD_PX)}px`;
+        layers.forEach((layer) => {
+          const el = layer.getElement() as SVGElement | undefined;
+          if (el) el.style.strokeDashoffset = offset;
+        });
+      }, FLOW_TICK_MS);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearInterval(timer);
+      layers.forEach((layer) => layer.remove());
+    };
+  }, [map, routes, weight]);
+
+  return null;
+}
+
 function RouteLines({ routes }: { routes: RenderableRoute[] }) {
   const map = useMap();
   const [zoom, setZoom] = useState(() => map.getZoom());
@@ -420,25 +489,7 @@ function RouteLines({ routes }: { routes: RenderableRoute[] }) {
           }}
         />
       ))}
-      {ANIMATE_ROUTES &&
-        routes
-          .filter((route) => !route.dashArray)
-          .map((route) => (
-            <Polyline
-              key={`${route.id}-flow`}
-              positions={route.positions}
-              interactive={false}
-              smoothFactor={ROUTE_SMOOTH_FACTOR}
-              pathOptions={{
-                ...ROUTE_LINE_OPTIONS,
-                color: '#ffffff',
-                weight: Math.max(2, weight - 3),
-                opacity: 0.95,
-                dashArray: '1 18',
-                className: 'route-flow',
-              }}
-            />
-          ))}
+      {ANIMATE_ROUTES && <FlowDots routes={routes} weight={weight} />}
     </React.Fragment>
   );
 }
@@ -1210,12 +1261,9 @@ export default function AdminFleetMap({ stops = [], routes = [] }: AdminFleetMap
 
   return (
     <div className="w-full h-[520px] bg-slate-950 border border-slate-800 rounded-xl relative overflow-hidden flex flex-col justify-between shadow-xl">
-      {/* Moving dots along the routes (direction of travel) */}
+      {/* Map background softening */}
       <style>{`
         .basemap-soft { filter: saturate(0.75) brightness(1.03); }
-        .route-flow { animation: route-flow 1.4s linear infinite; }
-        @keyframes route-flow { to { stroke-dashoffset: -38; } }
-        @media (prefers-reduced-motion: reduce) { .route-flow { animation: none; } }
       `}</style>
       {/* Top Floating Overlay */}
       <div className="absolute top-4 left-14 right-4 flex justify-between items-center z-[1000] pointer-events-none">
