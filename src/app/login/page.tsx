@@ -4,6 +4,11 @@ import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { setAdminToken } from '@/services/adminAuth';
 
+// Same backend address as the rest of the dashboard (.env.local / Vercel settings)
+const API_ORIGIN = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001')
+  .replace(/\/+$/, '')
+  .replace(/\/api$/, '');
+
 export default function LoginPage() {
   const router = useRouter();
   const [username, setUsername] = useState('');
@@ -21,8 +26,34 @@ export default function LoginPage() {
         throw new Error('Please enter username and password.');
       }
 
-      // Save token so AdminRouteGuard grants access
-      setAdminToken('admin_mock_session_token');
+      // FIX: check the username and password with the backend. Before, any
+      // username/password was accepted and a fake token was saved.
+      let response: Response;
+      try {
+        response = await fetch(`${API_ORIGIN}/api/auth/admin/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username.trim(), password }),
+        });
+      } catch {
+        throw new Error(
+          "Can't reach the server. It may be waking up, so wait a minute and try again."
+        );
+      }
+
+      const data = await response.json().catch(() => ({}));
+
+      if (response.status === 401) {
+        throw new Error('Wrong username or password.');
+      }
+      if (!response.ok) {
+        throw new Error(data?.error || `Login failed (${response.status}).`);
+      }
+      if (typeof data?.token !== 'string' || !data.token) {
+        throw new Error('The server did not return a login token.');
+      }
+
+      setAdminToken(data.token);
       router.replace('/');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Login failed');
@@ -36,7 +67,7 @@ export default function LoginPage() {
       <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl space-y-6">
         <div className="text-center space-y-2">
           <h1 className="text-2xl font-bold text-white tracking-tight">Admin Portal</h1>
-          <p className="text-xs text-slate-400">Sign in to manage fleet operations</p>
+          <p className="text-xs text-slate-400">Sign in to manage the campus shuttle fleet</p>
         </div>
 
         {error && (
@@ -51,6 +82,7 @@ export default function LoginPage() {
             <input
               type="text"
               required
+              autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="admin"
@@ -63,6 +95,7 @@ export default function LoginPage() {
             <input
               type="password"
               required
+              autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
