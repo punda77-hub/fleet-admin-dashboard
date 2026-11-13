@@ -91,7 +91,7 @@ export function RealtimeFleetOverview() {
                 </span>
               </div>
               <div className="text-xs text-slate-400 pt-1">
-                <div>Coords: {v.lat.toFixed(4)}, {v.lng.toFixed(4)}</div>
+                <div>Coords: {v.lat != null ? Number(v.lat).toFixed(4) : '–'}, {v.lng != null ? Number(v.lng).toFixed(4) : '–'}</div>
                 <div>Speed: {v.speed ?? 0} km/h • Heading: {v.heading ?? 0}°</div>
               </div>
               {v.updatedAt && (
